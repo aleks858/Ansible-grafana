@@ -1,0 +1,133 @@
+---
+- name: Установка Grafana в Kubernetes
+  hosts: k8s_master
+  become: yes
+  gather_facts: yes
+  vars:
+    monitoring_namespace: "monitoring"
+    grafana_node: "k8s-worker-01"
+    helm_bin: "/usr/local/bin/helm"
+    grafana_admin_user: "admin"
+    # В целях безопасности лучше использовать Vault или переменные окружения.
+    # Здесь задать пароль!
+    grafana_admin_password: 
+
+  tasks:
+
+    # ============================================
+    # ШАГ 0. ПРОВЕРКА KUBECONFIG (как в вашем плейбуке)
+    # ============================================
+    - name: Проверить kubectl от root
+      command: kubectl get nodes
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: kubectl_check
+      changed_when: false
+
+    # ============================================
+    # ШАГ 1. ДОБАВИТЬ РЕПОЗИТОРИЙ GRAFANA
+    # ============================================
+    - name: Добавить репозиторий grafana
+      command: "{{ helm_bin }} repo add grafana https://grafana.github.io/helm-charts"
+      changed_when: true
+      ignore_errors: yes
+
+    - name: Обновить репозитории
+      command: "{{ helm_bin }} repo update"
+      changed_when: true
+
+    # ============================================
+    # ШАГ 2. СОЗДАТЬ VALUES ФАЙЛ ДЛЯ GRAFANA
+    # ============================================
+    - name: Создать values.yaml для Grafana
+      copy:
+        content: |
+          # Настройки администратора
+          adminUser: {{ grafana_admin_user }}
+          adminPassword: {{ grafana_admin_password }}
+
+          # Настройки сервиса (NodePort для доступа извне)
+          service:
+            type: NodePort
+            port: 80
+            nodePort: 30030
+
+          # Привязка к конкретной ноде (как в вашем плейбуке для Prometheus)
+          nodeSelector:
+            kubernetes.io/hostname: {{ grafana_node }}
+
+          # Отключаем persistence для простоты (как в вашем Prometheus)
+          persistence:
+            enabled: false
+
+          # Настройка ресурсов (рекомендуемые значения)
+          resources:
+            requests:
+              cpu: 250m
+              memory: 750Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+
+          # Настройка Datasources (автоматическое подключение Prometheus)
+          datasources:
+            datasources.yaml:
+              apiVersion: 1
+              datasources:
+                - name: Prometheus
+                  type: prometheus
+                  access: proxy
+                  orgId: 1
+                  # Внутренний адрес сервиса Prometheus в кластере
+                  url: http://prometheus-server.{{ monitoring_namespace }}.svc.cluster.local
+                  isDefault: true
+                  editable: false
+        dest: /tmp/grafana-values.yaml
+        mode: '0644'
+
+    # ============================================
+    # ШАГ 3. УСТАНОВИТЬ GRAFANA
+    # ============================================
+    - name: Установить Grafana
+      command: >
+        {{ helm_bin }} upgrade --install grafana
+        grafana/grafana
+        --namespace {{ monitoring_namespace }}
+        --create-namespace
+        --values /tmp/grafana-values.yaml
+        --timeout 10m
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: helm_install
+      changed_when: true
+
+    - name: Показать результат установки
+      debug:
+        msg: "{{ helm_install.stdout_lines }}"
+
+    # ============================================
+    # ШАГ 4. ПРОВЕРКА
+    # ============================================
+    - name: Подождать 30 секунд
+      pause:
+        seconds: 30
+
+    - name: Проверить поды Grafana
+      command: kubectl get pods -n {{ monitoring_namespace }} -l app.kubernetes.io/name=grafana
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: pods
+      changed_when: false
+
+    - name: Показать поды
+      debug:
+        msg: "{{ pods.stdout_lines }}"
+
+    - name: Показать информацию для доступа
+      debug:
+        msg:
+          - "Grafana установлена!"
+          - "URL: http://{{ ansible_default_ipv4.address }}:30030"
+          - "Логин: {{ grafana_admin_user }}"
+          - "Пароль: {{ grafana_admin_password }}"
+          - "Источник данных Prometheus настроен автоматически."
